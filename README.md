@@ -1,163 +1,26 @@
-# imageTidy Migration Guide (Python/Eel -> Tauri React+Rust)
+# photoTidy
 
-## 1. Migration Goals
-- Recreate the existing desktop workflow with Tauri 2.x (Rust core + React front-end) while preserving all current behaviors implemented in `app.py` and `functions/utility.py`.
-- Improve cross-platform stability, path handling, and packaging while enabling future AI-assisted feature work.
-- Maintain compatibility with current JSON artifacts (`origin.info.json`, `target.fileStructure.json`) so historical data remains usable.
+## 项目简介
+photoTidy 是一个基于 Tauri 2 + React + Rust 的跨平台桌面应用，目标是帮助用户整理海量照片与视频资料。项目在保留原有工作流数据契约的前提下，采用 SQLite 持久化、结构化日志与现代前端栈，为后续的媒体扫描、规划与执行流程打下基础。
 
-## 2. Current Application Summary
-### 2.1 Runtime Overview (`app.py`)
-- Uses Eel to bridge a Vue/Vuetify front-end (`vue/src` for dev, `web` for prod) with Python logic.
-- Builds configuration from `config/config.json`, but rewrites most paths to reside under the user home directory at runtime.
-- Exposes functions to the front-end through `@eel.expose`, primarily `getImageRoot`, `openImageRootFolder`, and `showFiles`.
-- Coordinates image scanning, metadata extraction, deduplication, and planning of copy targets.
+## 已实现功能
+- **跨平台基础框架**：完成 Tauri 2.0 + React + TypeScript 脚手架，引入 Zustand 作为状态管理，并整合 Tailwind 风格化能力。
+- **配置服务**：Rust `ConfigService` 在启动时解析 `config/config.json`，支持 HOME/DATA 目录的环境变量覆盖，统一输出 UI 所需的展平配置。
+- **SQLite 初始化**：定义媒体清单、计划项与操作日志三大表结构，自动迁移并写入 schema 版本元数据。
+- **核心工具库**：移植路径归一化、JSON 读写、哈希计算（MD5/BLAKE3）、时间戳格式化与目录遍历等工具函数，供后续扫描/规划逻辑复用。
+- **事件与日志**：配置 `tracing` 日志订阅器，预留应用内事件常量，确保前后端间的可观测性。
+- **前端配置总览**：UI 在启动与事件广播时拉取配置快照，展示数据库位置、输入/输出目录、重复文件目录及可扫描的扩展名。
+- **工程化链路**：引入 ESLint v9 Flat Config、Prettier、Vitest（含 jest-dom 预设）与基础 Rust 单元测试，提供 `lint` / `test` / `cargo test` 三套校验流程。
+- **开发文档**：新增 `docs/setup.md` 指南，并在 README 中集中链接项目文档以便新人快速上手。
 
-### 2.2 Helper Utilities (`functions/utility.py`)
-- `timeFormat` / `buildTime`: format timestamps as `YYYY-MM-DD_HH-MM-SS` strings.
-- `formatPath`: normalizes paths to POSIX separators and absolute form.
-- `jsonLoad` / `jsonDump`: thin wrappers for JSON IO; `jsonDump` creates parent directories when missing.
-- `fileList`: recursive directory walk with optional extension filtering.
-- `hashFile`: computes MD5 digest for duplicate detection (block size 64 KB).
-- `readExifInfo`: uses `exifread` to pull EXIF metadata (DateTimeOriginal, Model, Artist, Make); falls back to file `mtime` if EXIF missing.
+## 计划中
+- **媒体扫描管线**：实现 `scan_media` 工作线程，递归枚举媒体文件、增量更新 SQLite，并结合哈希缓存与 EXIF 元数据提取。
+- **规划与执行引擎**：将 `makeNewPath` 迁移为 `plan_targets`，并构建复制/移动执行流程、操作日志与回滚能力。
+- **前端工作流界面**：重建配置初始化、扫描进度、计划审查、执行结果等关键页面，实时呈现事件进度与重复文件提醒。
+- **质量保障**：补充实用工具与端到端测试、对比旧版 Python 输出的快照测试，以及 Playwright E2E 流程。
+- **打包发布**：完成 Windows/macOS/Linux 打包、权限校验、版本与签名流程，并筹备 Beta 发布。
 
-### 2.3 High-Level Workflow
-1. Front-end calls `getImageRoot` to bootstrap directories under the user home folder and fetch configuration defaults.
-2. User triggers `showFiles`, which calls `readStructure` for the configured root directory.
-3. `readStructure` builds a canonical list of files (`originFileStructure`) with hashes, EXIF-derived timestamps, file sizes, and duplicate flags. Results persisted to `origin.info.json` inside the output directory.
-4. `makeNewPath` consumes the origin data to produce `target.fileStructure.json`, calculating destination folders grouped by capture date and a dedicated duplicate folder.
-5. `copyFiles` (currently manual) copies files into the planned folder tree using `shutil.copy2` for metadata preservation.
-6. Placeholders exist for `killUseless`, `moveFiles`, and `undoMoves` but are not implemented in Python.
-
-### 2.4 Config Behavior (`config/config.json`)
-- Keys of interest: `imageRootDefaultName`, `imageExts`, `outputRootName`, `originInfoJson`, `targetFileStructureJson`, `folderForDuplicates`.
-- At runtime, `Config` prepends the user home directory and ensures trailing slashes when forming `imageRoot`, `output`, and `folderForDuplicates`.
-- `imageExts` controls which files are scanned; includes common image/video formats (jpg, png, mov, mp4, etc.).
-
-## 3. Persisted Data Contracts
-### 3.1 `origin.info.json`
-- Structure persisted by `readStructure`:
-  ```json
-  {
-      "buildTime": "2021-10-22_09-01-02",
-      "fileCount": 42,
-      "duplicateFiles": 5,
-      "uniqueFileIDs": ["md5hash1", "md5hash2"],
-      "originFileStructure": [
-          {
-              "fileHash": "md5hash1",
-              "fileName": "IMG_0001.JPG",
-              "fullPath": "/abs/path/IMG_0001.JPG",
-              "fileSize": 123456,
-              "exif": {
-                  "DateTime": "2021-06-01_10-30-00",
-                  "modifyDateTime": "2021-06-02_11-00-00",
-                  "Image Model": "iPhone12,3"
-              },
-              "isDuplicate": false
-          }
-      ]
-  }
-  ```
-- `DateTime` is formatted with colons replaced by dashes and spaces by underscores.
-- `isDuplicate` marks subsequent files sharing an earlier MD5 hash.
-
-### 3.2 `target.fileStructure.json`
-- Generated by `makeNewPath` with entries like:
-  ```json
-  {
-      "fileHash": "md5hash1",
-      "fileSize": 123456,
-      "originFileName": "IMG_0001.JPG",
-      "newFileName": "2021-06-01_10-30-00.IMG_0001.JPG",
-      "originFullPath": "/abs/path/IMG_0001.JPG",
-      "newPath": "/Users/<user>/<outputRootName>/2021-06-01/"
-  }
-  ```
-- Duplicate files route to `<output>/<folderForDuplicates>/` instead of the date folder.
-- Copy/move operations concatenate `newPath + newFileName` (no separator injection), so `newPath` must end with `/`.
-
-## 4. Side Effects and Dependencies
-- Filesystem: Reads entire directory trees under `config.imageRoot`; writes JSON metadata and target copies to `config.output`.
-- External package: `exifread` for metadata extraction; requires consistent binary builds when packaging.
-- OS integration: Uses `os.startfile` on Windows, `open`/`xdg-open` elsewhere to show folders.
-- Path assumptions: Trailing slash management is critical; Python implementation relies on `os.mkdir` for single-level directory creation (will fail without parent directories).
-
-## 5. Known Gaps and Pain Points
-- Duplicate handling is copy-only; `moveFiles`, `undoMoves`, and `killUseless` are unimplemented.
-- No resilience against permission errors, long paths, or invalid EXIF timestamps.
-- `copyFiles` uses `os.mkdir` instead of `os.makedirs`, limiting nested folder creation.
-- Config localization relies on UTF-8 names but the runtime defaults enforce ASCII when writing (consider Unicode support explicitly in Rust).
-
-## 6. Target Tauri Architecture
-### 6.1 Proposed Rust Command Surface
-| Python Function | Rust Command (suggested) | Responsibility |
-|-----------------|---------------------------|----------------|
-| `getImageRoot`  | `bootstrap_paths`         | Resolve user directories, ensure existence, return config payload to UI. |
-| `openImageRootFolder` | `open_path`         | Delegate to platform-specific shell open. |
-| `showFiles` / `readStructure` | `scan_media` | Walk directories, hash files, read EXIF, emit origin data. |
-| `makeNewPath`    | `plan_targets`           | Load origin cache, compute target file plan, return preview + persist JSON. |
-| `copyFiles`      | `execute_plan`           | Create directories recursively and copy/move files. |
-| `moveFiles`      | `execute_plan` with mode | Move files instead of copy, honour duplicate folder. |
-| `undoMoves`      | `restore_originals`      | Reconstruct original layout using cached metadata. |
-| `Config.save`    | `write_config`           | Persist user overrides and migrations. |
-
-### 6.2 Rust Implementation Notes
-- Use `tauri::command` functions returning `Result<T, String>` with serialized structs matching the JSON contracts above.
-- Prefer `PathBuf` for path handling; normalise to forward slashes before serializing to keep current UI expectations.
-- Replace MD5 via `md-5` crate (or `ring::digest`) and stream large files with buffered reads similar to Python block size.
-- For EXIF, leverage `kamadak-exif` crate; fall back to filesystem metadata when tags missing.
-- Persist JSON using `serde_json`. Ensure parent directories created with `std::fs::create_dir_all`.
-- Cache file plans in memory (e.g., `Arc<RwLock<Option<OriginData>>>`) to avoid re-reading disk when the UI requests previews repeatedly.
-- Implement dedupe detection by tracking hashes in a `HashSet<String>`.
-
-### 6.3 Front-End (React) Data Contracts
-- Mirror the Python JSON shapes as TypeScript interfaces (`OriginFile`, `OriginSnapshot`, `TargetFilePlan`).
-- Centralize API calls in a client module using `@tauri-apps/api/tauri` `invoke` wrappers.
-- UI states inferred from Python workflow (README):
-  1. Select source folder (use Tauri dialog); persist choice via `write_config`.
-  2. Preview origin stats: counts, duplicates, per-file metadata.
-  3. Display proposed target structure grouped by capture date and duplicate bucket.
-  4. Provide action buttons for `copy`, `move`, `undo`, plus progress feedback.
-  5. Offer folder open shortcuts leveraging `open_path`.
-- Consider virtualization for large file lists and progress bars for long copy operations.
-
-### 6.4 Configuration Strategy
-- Store user overrides in `AppDir`/`Config` directory using Tauri `path` API.
-- Keep file names (`origin.info.json`, `target.fileStructure.json`) to avoid breaking downstream workflows, but allow advanced settings (custom duplicate folder name) via UI.
-- Ensure Unicode directory names survive roundtrips; React UI should show them unescaped.
-
-### 6.5 Error Handling & Logging
-- Surface granular errors (permission denied, read failures, EXIF parse issues) to the UI with actionable suggestions.
-- Log detailed diagnostics using Tauri `tracing` subscriber; allow users to export logs when AI-assisted debugging is required.
-- Ensure long-running commands stream progress via Tauri events (`tauri::async_runtime::spawn`, `app_handle.emit_all`).
-
-## 7. Suggested Migration Steps
-1. **Baseline Setup**: Scaffold a new Tauri project with React front-end; integrate TypeScript and state management (React Query or Zustand).
-2. **Port Utilities**: Implement Rust helpers for path formatting, JSON IO, hashing, EXIF extraction, and timestamp formatting.
-3. **Config Bootstrap**: Create `bootstrap_paths` and `write_config` commands, ensuring directories mirror Python defaults.
-4. **Scanning Pipeline**: Port `scan_media` logic with concurrency (optional) while matching Python field names and duplication semantics.
-5. **Planning Logic**: Implement `plan_targets` replicating `makeNewPath` naming conventions and duplicate routing.
-6. **Execution Engine**: Build `execute_plan` supporting copy and move modes, generating progress events and failure rollbacks.
-7. **Undo Support**: Implement `restore_originals` leveraging cached origin data; design additional metadata if required (e.g., mapping moved files).
-8. **React UI**: Port Vue interactions to React components, aligning with the workflow from the README.
-9. **Testing & Validation**: Create automated tests and manual scripts replicating Python outputs on sample data (`sampleImages`).
-10. **Packaging**: Configure Tauri bundles for Windows/macOS/Linux, validate path permissions, and ensure EXIF dependencies compile.
-
-## 8. Testing Checklist
-- Unit tests for hashing, EXIF fallbacks, timestamp formatting, and JSON serialization.
-- Integration test: run `scan_media` + `plan_targets` against `sampleImages` and compare with Python-generated artifacts.
-- End-to-end test: simulate copy plan execution into a temp directory, verify duplicates routed correctly.
-- Regression suite ensuring Unicode folder names and mixed path separators behave as expected.
-
-## 9. Opportunities for Enhancements
-- Support additional media metadata (GPS, camera settings) for richer UI filters.
-- Add configurable naming templates for destination folders and files.
-- Provide dry-run reports and diff views before executing copy/move.
-- Introduce background scheduling or watch mode to keep library organized automatically.
-- Integrate with AI tooling to suggest duplicate resolution or highlight low-quality images.
-
-## 10. AI Collaboration Notes
-- Keep data contracts versioned (e.g., `schemaVersion`) so AI agents can detect changes.
-- Document each Rust command with doc comments summarizing inputs/outputs for LLM ingestion.
-- Maintain example command transcripts in the repo to illustrate expected payloads.
-- Encourage deterministic outputs (sorted file lists) to simplify diff-based verification by AI assistants.
+## 相关文档
+- [开发计划](docs/plan.md)
+- [系统结构图](docs/structure.md)
+- [本地开发环境搭建](docs/setup.md)
