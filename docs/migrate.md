@@ -132,7 +132,7 @@
 - Ensure long-running commands stream progress via Tauri events (`tauri::async_runtime::spawn`, `app_handle.emit_all`).
 
 ## 7. Suggested Migration Steps
-1. **Baseline Setup**: Scaffold a new Tauri project with React front-end; integrate TypeScript and state management (React Query or Zustand).
+1. **Baseline Setup**: Scaffold a new Tauri project with React front-end; integrate TypeScript and state management (Zustand).
 2. **Port Utilities**: Implement Rust helpers for path formatting, JSON IO, hashing, EXIF extraction, and timestamp formatting.
 3. **Config Bootstrap**: Create `bootstrap_paths` and `write_config` commands, ensuring directories mirror Python defaults.
 4. **Scanning Pipeline**: Port `scan_media` logic with concurrency (optional) while matching Python field names and duplication semantics.

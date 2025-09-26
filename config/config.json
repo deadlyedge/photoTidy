@@ -1,0 +1,19 @@
+{
+    "注意": "请保留文件夹名称末尾的'/'斜线",
+    "imageRoot": "../sampleImages/",
+    "imageRootDefaultName": "待整理文件",
+    "imageExts": [
+        ".jpg",
+        ".bmp",
+        ".png",
+        ".jpeg",
+        ".gif",
+        ".mov",
+        ".mp4"
+    ],
+    "output": "output/",
+    "outputRootName": "整理好的文件",
+    "originInfoJson": "origin.info.json",
+    "targetFileStructureJson": "target.fileStructure.json",
+    "folderForDuplicates": "重复文件/"
+}
