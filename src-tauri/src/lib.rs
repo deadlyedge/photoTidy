@@ -3,6 +3,7 @@ mod db;
 mod error;
 mod events;
 mod logging;
+mod scan;
 pub mod utils;
 
 use std::sync::Arc;
@@ -12,8 +13,9 @@ use tracing::{error, info};
 
 use crate::config::{AppConfig, ConfigPayload, ConfigService, SCHEMA_VERSION};
 use crate::db::Database;
-use crate::events::EVENT_BOOTSTRAP_CONFIG;
+use crate::events::{EVENT_BOOTSTRAP_CONFIG, EVENT_SCAN_PROGRESS};
 use crate::logging::init_logging;
+use crate::scan::{perform_scan, ProgressEmitter, ScanSummary};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -36,6 +38,14 @@ impl AppState {
     pub fn database(&self) -> &Database {
         self.database.as_ref()
     }
+
+    pub fn config_arc(&self) -> Arc<ConfigService> {
+        Arc::clone(&self.config)
+    }
+
+    pub fn database_arc(&self) -> Arc<Database> {
+        Arc::clone(&self.database)
+    }
 }
 
 #[tauri::command]
@@ -45,6 +55,30 @@ fn bootstrap_paths(state: tauri::State<'_, AppState>, app: AppHandle) -> ConfigP
         error!("failed to emit bootstrap event: {err:?}");
     }
     payload
+}
+
+#[tauri::command]
+async fn scan_media(
+    state: tauri::State<'_, AppState>,
+    app: AppHandle,
+) -> Result<ScanSummary, String> {
+    let config = state.config_arc();
+    let database = state.database_arc();
+    let app_handle = app.clone();
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter: ProgressEmitter = Arc::new(move |payload| {
+            if let Err(err) = app_handle.emit(EVENT_SCAN_PROGRESS, payload.clone()) {
+                tracing::debug!(error = ?err, "failed emitting scan progress");
+            }
+        });
+
+        let snapshot = config.snapshot();
+        perform_scan(&snapshot, database.as_ref(), emitter)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())
 }
 
 pub fn run() {
@@ -67,7 +101,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .manage(AppState::new(config_service, database))
-        .invoke_handler(tauri::generate_handler![bootstrap_paths])
+        .invoke_handler(tauri::generate_handler![bootstrap_paths, scan_media])
         .setup(|app| {
             if let Some(state) = app.try_state::<AppState>() {
                 let payload = state.config().payload();
