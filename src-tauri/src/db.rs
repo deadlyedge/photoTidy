@@ -1,11 +1,12 @@
+use std::convert::TryFrom;
 use std::time::Duration;
 
 use crate::config::{AppConfig, SCHEMA_VERSION};
-use crate::error::Result;
+use crate::error::{AppError, Result};
 use parking_lot::{Mutex, MutexGuard};
 use rusqlite::{params, Connection};
 
-const DB_VERSION: i32 = 2;
+const DB_VERSION: i32 = 3;
 
 #[derive(Debug, Clone)]
 pub struct InventoryRecord {
@@ -21,6 +22,73 @@ pub struct InventoryRecord {
     pub exif_make: Option<String>,
     pub exif_artist: Option<String>,
     pub is_duplicate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct PlanRecord {
+    pub id: i64,
+    pub file_hash: String,
+    pub file_size: u64,
+    pub origin_file_name: String,
+    pub origin_full_path: String,
+    pub target_path: String,
+    pub target_file_name: String,
+    pub is_duplicate: bool,
+    pub status: PlanStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPlanEntry {
+    pub file_hash: String,
+    pub file_size: u64,
+    pub origin_file_name: String,
+    pub origin_full_path: String,
+    pub target_path: String,
+    pub target_file_name: String,
+    pub is_duplicate: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewOperationLog {
+    pub plan_entry_id: i64,
+    pub operation: String,
+    pub status: String,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanStatus {
+    Pending,
+    Copied,
+    Moved,
+    Failed,
+}
+
+impl PlanStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Copied => "copied",
+            Self::Moved => "moved",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for PlanStatus {
+    type Error = AppError;
+
+    fn try_from(value: &str) -> Result<Self> {
+        match value {
+            "pending" => Ok(Self::Pending),
+            "copied" => Ok(Self::Copied),
+            "moved" => Ok(Self::Moved),
+            "failed" => Ok(Self::Failed),
+            other => Err(AppError::internal(format!(
+                "unsupported plan status: {other}"
+            ))),
+        }
+    }
 }
 
 pub struct Database {
@@ -59,25 +127,56 @@ impl Database {
         )?;
 
         let rows = stmt.query_map([], |row| {
-            Ok(InventoryRecord {
-                id: row.get::<_, Option<i64>>(0)?,
-                file_hash: row.get(1)?,
-                blake3_hash: row.get::<_, Option<String>>(2)?,
-                file_size: row.get::<_, i64>(3)? as u64,
-                file_name: row.get(4)?,
-                relative_path: row.get(5)?,
-                captured_at: row.get::<_, Option<String>>(6)?,
-                modified_at: row.get(7)?,
-                exif_model: row.get::<_, Option<String>>(8)?,
-                exif_make: row.get::<_, Option<String>>(9)?,
-                exif_artist: row.get::<_, Option<String>>(10)?,
-                is_duplicate: row.get::<_, i64>(11)? != 0,
-            })
+            Ok((
+                row.get::<_, Option<i64>>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<String>>(9)?,
+                row.get::<_, Option<String>>(10)?,
+                row.get::<_, i64>(11)?,
+            ))
         })?;
 
         let mut records = Vec::new();
         for row in rows {
-            records.push(row?);
+            let (
+                id,
+                file_hash,
+                blake3_hash,
+                file_size,
+                file_name,
+                relative_path,
+                captured_at,
+                modified_at,
+                exif_model,
+                exif_make,
+                exif_artist,
+                is_duplicate,
+            ) = row?;
+
+            let file_size = u64::try_from(file_size)
+                .map_err(|_| AppError::internal("negative file size in inventory"))?;
+
+            records.push(InventoryRecord {
+                id,
+                file_hash,
+                blake3_hash,
+                file_size,
+                file_name,
+                relative_path,
+                captured_at,
+                modified_at,
+                exif_model,
+                exif_make,
+                exif_artist,
+                is_duplicate: is_duplicate != 0,
+            });
         }
         Ok(records)
     }
@@ -87,6 +186,8 @@ impl Database {
         let tx = conn.transaction()?;
         tx.execute("DELETE FROM media_inventory", [])?;
         for record in records {
+            let file_size = i64::try_from(record.file_size)
+                .map_err(|_| AppError::internal("file size exceeds sqlite limits"))?;
             tx.execute(
                 "INSERT INTO media_inventory (file_hash, blake3_hash, file_size, file_name, \
                  relative_path, captured_at, modified_at, exif_model, exif_make, exif_artist, \
@@ -95,7 +196,7 @@ impl Database {
                 params![
                     record.file_hash,
                     record.blake3_hash,
-                    record.file_size as i64,
+                    file_size,
                     record.file_name,
                     record.relative_path,
                     record.captured_at,
@@ -111,6 +212,124 @@ impl Database {
         tx.commit()?;
         Ok(())
     }
+
+    pub fn replace_plan_entries(&self, entries: &[NewPlanEntry]) -> Result<()> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM operation_logs", [])?;
+        tx.execute("DELETE FROM plan_entries", [])?;
+        for entry in entries {
+            let file_size = i64::try_from(entry.file_size)
+                .map_err(|_| AppError::internal("file size exceeds sqlite limits"))?;
+            tx.execute(
+                "INSERT INTO plan_entries (file_hash, file_size, origin_file_name, origin_full_path, \
+                 target_path, target_file_name, is_duplicate, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+                params![
+                    entry.file_hash,
+                    file_size,
+                    entry.origin_file_name,
+                    entry.origin_full_path,
+                    entry.target_path,
+                    entry.target_file_name,
+                    if entry.is_duplicate { 1 } else { 0 },
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn plan_entries(&self) -> Result<Vec<PlanRecord>> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT id, file_hash, file_size, origin_file_name, origin_full_path, target_path, \
+             target_file_name, is_duplicate, status FROM plan_entries ORDER BY id",
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, String>(6)?,
+                row.get::<_, i64>(7)?,
+                row.get::<_, String>(8)?,
+            ))
+        })?;
+
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                id,
+                file_hash,
+                file_size,
+                origin_file_name,
+                origin_full_path,
+                target_path,
+                target_file_name,
+                is_duplicate,
+                status,
+            ) = row?;
+
+            let status = PlanStatus::try_from(status.as_str())?;
+            let file_size = u64::try_from(file_size)
+                .map_err(|_| AppError::internal("negative file size in plan entry"))?;
+
+            records.push(PlanRecord {
+                id,
+                file_hash,
+                file_size,
+                origin_file_name,
+                origin_full_path,
+                target_path,
+                target_file_name,
+                is_duplicate: is_duplicate != 0,
+                status,
+            });
+        }
+
+        Ok(records)
+    }
+
+    pub fn plan_entries_with_status(&self, statuses: &[PlanStatus]) -> Result<Vec<PlanRecord>> {
+        if statuses.is_empty() {
+            return self.plan_entries();
+        }
+
+        let entries = self.plan_entries()?;
+        Ok(entries
+            .into_iter()
+            .filter(|entry| statuses.contains(&entry.status))
+            .collect())
+    }
+
+    pub fn update_plan_status(&self, id: i64, status: PlanStatus) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "UPDATE plan_entries SET status = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2",
+            params![status.as_str(), id],
+        )?;
+        Ok(())
+    }
+
+    pub fn append_operation_log(&self, log: NewOperationLog) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT INTO operation_logs (plan_entry_id, operation, status, error) VALUES (?1, ?2, ?3, ?4)",
+            params![log.plan_entry_id, log.operation, log.status, log.error],
+        )?;
+        Ok(())
+    }
+
+    pub fn clear_operation_logs(&self) -> Result<()> {
+        let conn = self.conn();
+        conn.execute("DELETE FROM operation_logs", [])?;
+        Ok(())
+    }
 }
 
 fn apply_migrations(connection: &mut Connection) -> Result<()> {
@@ -121,6 +340,8 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
 
     if current_version < DB_VERSION {
         tx.execute("DROP TABLE IF EXISTS media_inventory", [])?;
+        tx.execute("DROP TABLE IF EXISTS plan_entries", [])?;
+        tx.execute("DROP TABLE IF EXISTS operation_logs", [])?;
     }
 
     tx.execute_batch(
@@ -151,6 +372,8 @@ fn apply_migrations(connection: &mut Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS plan_entries (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             file_hash TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            origin_file_name TEXT NOT NULL,
             origin_full_path TEXT NOT NULL,
             target_path TEXT NOT NULL,
             target_file_name TEXT NOT NULL,
@@ -236,6 +459,63 @@ mod tests {
         assert_eq!(snapshot.len(), 1);
         assert_eq!(snapshot[0].file_hash, record.file_hash);
         assert_eq!(snapshot[0].blake3_hash, record.blake3_hash);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_entries_round_trip() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let db_path = temp_dir.path().join("db.sqlite3");
+        let config = temp_config(db_path.clone());
+        let db = Database::initialize(&config)?;
+
+        let entry = NewPlanEntry {
+            file_hash: "hash".into(),
+            file_size: 64,
+            origin_file_name: "IMG_0001.JPG".into(),
+            origin_full_path: "/origin/IMG_0001.JPG".into(),
+            target_path: "/target/2024-01-01/".into(),
+            target_file_name: "2024-01-01_00-00-00.IMG_0001.JPG".into(),
+            is_duplicate: false,
+        };
+
+        db.replace_plan_entries(&[entry.clone()])?;
+        let stored = db.plan_entries()?;
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].status, PlanStatus::Pending);
+        assert_eq!(stored[0].target_file_name, entry.target_file_name);
+
+        db.update_plan_status(stored[0].id, PlanStatus::Copied)?;
+        let copied = db.plan_entries()?;
+        assert_eq!(copied[0].status, PlanStatus::Copied);
+
+        let copied_only = db.plan_entries_with_status(&[PlanStatus::Copied])?;
+        assert_eq!(copied_only.len(), 1);
+        let pending_only = db.plan_entries_with_status(&[PlanStatus::Pending])?;
+        assert!(pending_only.is_empty());
+
+        db.append_operation_log(NewOperationLog {
+            plan_entry_id: copied[0].id,
+            operation: "copy".into(),
+            status: "success".into(),
+            error: None,
+        })?;
+
+        {
+            let conn = db.conn();
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM operation_logs", [], |row| row.get(0))?;
+            assert_eq!(count, 1);
+        }
+
+        db.clear_operation_logs()?;
+        {
+            let conn = db.conn();
+            let count: i64 =
+                conn.query_row("SELECT COUNT(*) FROM operation_logs", [], |row| row.get(0))?;
+            assert_eq!(count, 0);
+        }
+
         Ok(())
     }
 
